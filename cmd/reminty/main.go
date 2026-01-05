@@ -121,7 +121,7 @@ Not supported (flagged as TODO):
 		fmt.Fprintf(os.Stderr, "Parsed %d tokens from %s\n", len(tokens), inputName)
 	}
 
-	p := parser.NewParser(tokens)
+	p := parser.NewParserWithSource(tokens, input)
 	result := p.Parse()
 
 	if verbose {

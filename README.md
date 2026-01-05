@@ -1,10 +1,14 @@
 # reminty
 
-Convert React/JSX components to Go + minty.
+Express UI ideas in JSX. Ship them in Go.
 
-## Status
+reminty converts React/JSX components to Go + [minty](https://github.com/ha1tch/minty), letting web developers be productive immediately while learning Go naturally through the code they ship.
 
-**Alpha** — works for simple components, more complex patterns need refinement.
+## Why
+
+Go teams building web applications often face a choice: split into frontend/backend camps, or have everyone learn both ecosystems. minty + HTMX offers a third path—full-stack Go—but the learning curve can slow initial productivity.
+
+reminty eliminates that curve. Write what you know (JSX), see how it maps to Go, ship working code. By the time the patterns are internalised, you're writing minty directly.
 
 ## Installation
 
@@ -12,257 +16,90 @@ Convert React/JSX components to Go + minty.
 go install github.com/ha1tch/reminty/cmd/reminty@latest
 ```
 
-Or build from source:
-
-```bash
-git clone https://github.com/ha1tch/reminty
-cd reminty
-go build ./cmd/reminty
-```
-
 ## Usage
 
 ```bash
-# Convert a file
-reminty Component.jsx
-
-# Output to file
-reminty -o component.go Component.jsx
-
-# Analyze patterns only (no code generation)
-reminty -analyze Component.jsx
-
-# Verbose output
-reminty -verbose Component.jsx
-
-# From stdin
-cat Component.jsx | reminty
+reminty Component.jsx              # Convert to stdout
+reminty -o component.go App.jsx    # Convert to file
+reminty -analyze Component.jsx     # Pattern analysis only
+reminty -verbose Component.jsx     # Full analysis + code
 ```
 
-## What It Does
+## Example
 
-### Converts JSX Structure
-
+**Input (React):**
 ```jsx
-// React
-<div className="card">
-  <h1>{title}</h1>
-  <p>{description}</p>
-</div>
-```
-
-```go
-// minty
-b.Div(mi.Class("card"),
-    b.H1(title),
-    b.P(description),
-)
-```
-
-### Maps .map() to mi.Each()
-
-```jsx
-// React
-{items.map(item => (
-  <li key={item.id}>{item.name}</li>
-))}
-```
-
-```go
-// minty
-mi.Each(items, func(item Item) mi.H {
-    return func(b *mi.Builder) mi.Node {
-        return b.Li(item.Name)
-    }
-})
-```
-
-### Converts Conditionals
-
-```jsx
-// React: {condition && <Element/>}
-// minty: mi.If(condition, element)
-
-// React: {condition ? <A/> : <B/>}
-// minty: mi.IfElse(condition, a, b)
-```
-
-### Detects Patterns and Suggests mintydyn
-
-When the tool detects React patterns, it suggests minty equivalents:
-
-| React Pattern | mintydyn Suggestion |
-|--------------|---------------------|
-| Tab state + UI | `mdy.Dyn("tabs").States(...)` |
-| Filter/search state | `mdy.Dyn("filter").Data(...)` |
-| Form field dependencies | `mdy.Dyn("form").Rules(...)` |
-| Dark mode toggle | `mi.DarkModeTailwind(...)` |
-| Modal state | HTMX modal pattern |
-| Pagination state | `mdy.FilterOptions{EnablePagination: true}` |
-
-### Flags Hooks for Manual Conversion
-
-```
-// TODO: This component uses React hooks that need manual conversion:
-//   - useState (line 5)
-//   - useEffect (line 8)
-```
-
-With suggestions:
-
-```
-// Line 5: useState
-//   → Consider: server state, mintydyn State, or HTMX pattern
-// Line 8: useEffect
-//   → Consider: server-side logic, OnInit hook, or HTMX trigger
-```
-
-## What It Handles
-
-✓ JSX element structure → minty builder calls  
-✓ className → mi.Class()  
-✓ Common attributes (href, src, id, etc.)  
-✓ Data attributes  
-✓ HTMX attributes (hx-get, hx-post, etc.)  
-✓ {items.map(...)} → mi.Each()  
-✓ {condition && <X/>} → mi.If()  
-✓ {cond ? <A/> : <B/>} → mi.IfElse()  
-✓ Component props → function parameters  
-✓ Import statements (parsed, noted)  
-✓ Hook detection with migration suggestions  
-✓ UI pattern detection with mintydyn suggestions  
-
-## What It Flags (TODO Comments)
-
-⚠ useState → suggests server state, mintydyn, or HTMX  
-⚠ useEffect → suggests server-side logic or OnInit hook  
-⚠ useContext → suggests Go context or function params  
-⚠ useReducer → suggests mintydyn Rules  
-⚠ useMemo/useCallback → notes these are unnecessary server-side  
-⚠ Spread attributes {...props}  
-⚠ Event handlers (onClick, onChange) → suggests HTMX  
-
-## What It Doesn't Handle
-
-✗ Complex hook logic (useReducer with complex state)  
-✗ Third-party components (Material UI, Chakra, etc.)  
-✗ CSS-in-JS (styled-components, emotion)  
-✗ Dynamic imports  
-✗ React Context with complex providers  
-✗ Higher-order components  
-✗ Render props patterns  
-✗ TypeScript types (stripped, not converted)  
-
-## Examples
-
-### Simple Component
-
-**Input (Button.jsx):**
-```jsx
-function Button({ text, variant }) {
+function PostCard({ post }) {
   return (
-    <button className={`btn btn-${variant}`}>
-      {text}
-    </button>
+    <article className={`card ${post.status}`}>
+      <h2>{post.title}</h2>
+      {post.category && <span className="tag">{post.category}</span>}
+      {post.likes > 0 && <span>{post.likes} likes</span>}
+    </article>
   );
 }
 ```
 
-**Output:**
+**Output (Go + minty):**
 ```go
-// Button component
-func Button(text string, variant string) mi.H {
+func PostCard(post map[string]interface{}) mi.H {
     return func(b *mi.Builder) mi.Node {
-        return b.Button(mi.Class(/* TODO: template literal */),
-            text,
+        return b.Article(mi.Class(fmt.Sprintf("card %v", mi.Str(post, "status"))),
+            b.H2(mi.Str(post, "title")),
+            mi.If(mi.Truthy(post["category"]), func(b *mi.Builder) mi.Node {
+                return b.Span(mi.Class("tag"), mi.Str(post, "category"))
+            }),
+            mi.If(mi.Gt(post, "likes", 0), func(b *mi.Builder) mi.Node {
+                return b.Span(mi.Str(post, "likes"), "likes")
+            }),
         )
     }
 }
 ```
 
-### Component with Hooks
+The output **compiles immediately**. Items needing attention are marked `/* TODO */`.
 
-**Input (Counter.jsx):**
-```jsx
-function Counter() {
-  const [count, setCount] = useState(0);
-  
-  return (
-    <div>
-      <p>Count: {count}</p>
-      <button onClick={() => setCount(count + 1)}>
-        Increment
-      </button>
-    </div>
-  );
-}
-```
+## What Translates
 
-**Output:**
-```go
-// Counter component
-// TODO: This component uses React hooks that need manual conversion:
-//   - useState (line 2)
-func Counter() mi.H {
-    return func(b *mi.Builder) mi.Node {
-        return b.Div(
-            b.P("Count: ", count),
-            b.Button(mi.Attr("onClick", /* TODO */),
-                "Increment",
-            ),
-        )
-    }
-}
+| React | Go + minty |
+|-------|------------|
+| JSX elements | Builder calls (`b.Div`, `b.Span`) |
+| `className` | `mi.Class()` |
+| `{post.title}` | `mi.Str(post, "title")` |
+| `{post.likes > 0 && ...}` | `mi.If(mi.Gt(post, "likes", 0), ...)` |
+| `{cond ? a : b}` | `mi.IfElse(cond, a, b)` |
+| `items.map(...)` | `mi.Each(items, ...)` |
+| `items.length` | `len(items)` |
+| Template literals | `fmt.Sprintf()` |
+| Event handlers | HTMX attributes + TODO |
 
-// =============================================================================
-// TRANSLATION NOTES
-// =============================================================================
-// Line 2: useState
-//   → Consider: server state, mintydyn State, or HTMX pattern
-```
+## What Needs Manual Work
 
-**Suggested minty approach:**
-```go
-// Server-side counter with HTMX
-func Counter(count int) mi.H {
-    return func(b *mi.Builder) mi.Node {
-        return b.Div(
-            b.P(fmt.Sprintf("Count: %d", count)),
-            b.Button(
-                mi.HtmxPost("/increment"),
-                mi.HtmxTarget("#counter"),
-                mi.HtmxSwap("outerHTML"),
-                "Increment",
-            ),
-        )
-    }
-}
-```
+- **Local computed variables:** `const isPublished = status === 'published'` → TODO
+- **Filter predicates:** Domain logic you'd write anyway
+- **HTTP handlers:** HTMX endpoints for interactivity
 
-## Options
+These are the parts that benefit from human judgment.
 
-```
--o, --output <file>   Write output to file (default: stdout)
--analyze              Only analyze patterns, don't generate code
--verbose              Show detailed analysis
--v, --version         Show version
--h, --help            Show help
-```
+## The Learning Path
 
-## Philosophy
+**Week 1:** Write JSX, run reminty, ship Go. Start predicting the output.
 
-reminty is not a full transpiler. React and Go+minty are fundamentally different paradigms:
+**Week 2:** Write simple components directly in minty. Use reminty for complex layouts.
 
-- React: Client-side state, virtual DOM, JavaScript runtime
-- minty: Server-side rendering, real DOM, Go compilation
+**Week 3:** JSX becomes optional—a sketch pad for thinking through UI.
 
-The tool helps you:
-1. Convert JSX structure (the easy part)
-2. Identify patterns that need rethinking (the hard part)
-3. Suggest minty/mintydyn equivalents where they exist
+**Month 2:** Minty-native. The training wheels come off.
 
-The goal is to give you a starting point, not a finished product. You'll need to think about where state belongs, how interactions should work, and which mintydyn patterns apply.
+## Requirements
+
+- Go 1.22+
+- [minty](https://github.com/ha1tch/minty) with helpers (`mi.Str`, `mi.Truthy`, etc.)
+
+## Documentation
+
+See [MANUAL.md](MANUAL.md) for the complete translation reference, architectural notes, and HTMX patterns.
 
 ## License
 
-Same as minty (Apache 2.0)
+Apache 2.0

@@ -29,11 +29,33 @@ type Component struct {
 	Props      []Prop
 	Body       Node
 	Hooks      []Hook
+	StateVars  []StateVariable // extracted useState variables
+	DerivedVars []DerivedVariable // const x = expr dependent on state
 	LineNumber int
 }
 
 func (c *Component) Type() NodeType { return NodeComponent }
 func (c *Component) Line() int      { return c.LineNumber }
+
+// StateVariable represents a useState declaration
+type StateVariable struct {
+	Name       string // variable name (e.g., "filter")
+	Setter     string // setter function name (e.g., "setFilter")
+	InitValue  string // initial value as string
+	InitType   string // inferred type: "string", "bool", "int", "[]interface{}"
+	LineNumber int
+}
+
+// DerivedVariable represents a const derived from state
+type DerivedVariable struct {
+	Name       string   // variable name (e.g., "filteredUsers")
+	Expression string   // the full expression
+	SourceVar  string   // source collection (e.g., "users")
+	Operation  string   // operation type: filter, map, find, some, every, reduce, sort, slice
+	ResultType string   // inferred Go type
+	DependsOn  []string // state variables it depends on
+	LineNumber int
+}
 
 // Prop represents a component prop
 type Prop struct {
@@ -52,6 +74,16 @@ type Hook struct {
 	LineNumber int
 }
 
+// EventHandler represents an event handler in JSX
+type EventHandler struct {
+	EventType   string   // onClick, onChange, onSubmit, etc.
+	HandlerBody string   // the handler expression/function body
+	SetterCalls []string // setState calls detected: ["setFilter", "setCount"]
+	StateVars   []string // state variables referenced
+	IsInline    bool     // true if inline arrow function
+	LineNumber  int
+}
+
 // Element represents a JSX element
 type Element struct {
 	Tag        string
@@ -66,11 +98,12 @@ func (e *Element) Line() int      { return e.LineNumber }
 
 // Attribute represents a JSX attribute
 type Attribute struct {
-	Name       string
-	Value      string     // for string values
-	Expression Expression // for {expression} values
-	IsSpread   bool       // for {...props}
-	SpreadExpr string
+	Name         string
+	Value        string        // for string values
+	Expression   Expression    // for {expression} values
+	IsSpread     bool          // for {...props}
+	SpreadExpr   string
+	EventHandler *EventHandler // parsed event handler (if applicable)
 }
 
 // Text represents text content

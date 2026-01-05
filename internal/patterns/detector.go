@@ -11,16 +11,18 @@ import (
 type PatternType string
 
 const (
-	PatternTabs         PatternType = "tabs"
-	PatternAccordion    PatternType = "accordion"
-	PatternFilter       PatternType = "filter"
-	PatternSearch       PatternType = "search"
-	PatternFormDeps     PatternType = "form-dependencies"
-	PatternModal        PatternType = "modal"
-	PatternDropdown     PatternType = "dropdown"
-	PatternPagination   PatternType = "pagination"
+	PatternTabs           PatternType = "tabs"
+	PatternAccordion      PatternType = "accordion"
+	PatternFilter         PatternType = "filter"
+	PatternSearch         PatternType = "search"
+	PatternFormDeps       PatternType = "form-dependencies"
+	PatternModal          PatternType = "modal"
+	PatternDropdown       PatternType = "dropdown"
+	PatternPagination     PatternType = "pagination"
 	PatternInfiniteScroll PatternType = "infinite-scroll"
-	PatternDarkMode     PatternType = "dark-mode"
+	PatternDarkMode       PatternType = "dark-mode"
+	PatternToggle         PatternType = "toggle"
+	PatternSortableTable  PatternType = "sortable-table"
 )
 
 // DetectedPattern represents a pattern found in the code
@@ -31,6 +33,8 @@ type DetectedPattern struct {
 	Description string
 	ReactCode   string
 	MintyCode   string
+	StateVars   []string // state variables involved
+	DerivedVars []string // derived variables involved
 }
 
 // Detector analyzes React code for patterns
@@ -77,11 +81,26 @@ func (d *Detector) AnalyzeSource(source string) []DetectedPattern {
 
 	// Pagination patterns
 	d.detectPaginationPattern(source)
+	
+	// Accordion patterns
+	d.detectAccordionPattern(source)
+	
+	// Toggle patterns
+	d.detectTogglePattern(source)
+	
+	// Sortable table patterns
+	d.detectSortableTablePattern(source)
 
 	return d.patterns
 }
 
 func (d *Detector) analyzeComponent(comp *parser.Component) {
+	// Analyze state variables for patterns
+	d.analyzeStatePatterns(comp)
+	
+	// Analyze derived variables for patterns
+	d.analyzeDerivedPatterns(comp)
+	
 	// Check hooks for patterns
 	for _, hook := range comp.Hooks {
 		switch hook.Type {
@@ -89,6 +108,169 @@ func (d *Detector) analyzeComponent(comp *parser.Component) {
 			d.analyzeStateUsage(hook, comp)
 		case "useEffect":
 			d.analyzeEffectUsage(hook, comp)
+		}
+	}
+}
+
+// analyzeStatePatterns detects patterns from useState variables
+func (d *Detector) analyzeStatePatterns(comp *parser.Component) {
+	stateNames := make(map[string]parser.StateVariable)
+	for _, sv := range comp.StateVars {
+		stateNames[strings.ToLower(sv.Name)] = sv
+	}
+	
+	// Tab pattern: activeTab/selectedTab + string type
+	for name, sv := range stateNames {
+		if (strings.Contains(name, "tab") || strings.Contains(name, "selected")) && 
+			sv.InitType == "string" {
+			d.addPattern(DetectedPattern{
+				Type:        PatternTabs,
+				Line:        sv.LineNumber,
+				Confidence:  0.85,
+				Description: "Tab state with string selector",
+				ReactCode:   "useState('" + sv.InitValue + "') for tab selection",
+				StateVars:   []string{sv.Name},
+				MintyCode: generateTabsMinty(sv.Name, sv.InitValue),
+			})
+		}
+	}
+	
+	// Filter pattern: filter/search state + derived .filter()
+	for name, sv := range stateNames {
+		if (strings.Contains(name, "filter") || strings.Contains(name, "search") || 
+			strings.Contains(name, "query")) && sv.InitType == "string" {
+			// Check if there's a corresponding derived filter
+			hasDerivedFilter := false
+			for _, dv := range comp.DerivedVars {
+				if dv.Operation == "filter" {
+					hasDerivedFilter = true
+					break
+				}
+			}
+			
+			confidence := 0.7
+			if hasDerivedFilter {
+				confidence = 0.95
+			}
+			
+			d.addPattern(DetectedPattern{
+				Type:        PatternFilter,
+				Line:        sv.LineNumber,
+				Confidence:  confidence,
+				Description: "Filter/search with derived filtered list",
+				ReactCode:   "useState for filter + .filter() derived state",
+				StateVars:   []string{sv.Name},
+				MintyCode:   generateFilterMinty(sv.Name),
+			})
+		}
+	}
+	
+	// Modal/toggle pattern: boolean state for visibility
+	for name, sv := range stateNames {
+		if sv.InitType == "bool" {
+			if strings.Contains(name, "modal") || strings.Contains(name, "dialog") {
+				d.addPattern(DetectedPattern{
+					Type:        PatternModal,
+					Line:        sv.LineNumber,
+					Confidence:  0.85,
+					Description: "Modal visibility state",
+					ReactCode:   "useState(false) for modal",
+					StateVars:   []string{sv.Name},
+					MintyCode:   generateModalMinty(sv.Name),
+				})
+			} else if strings.Contains(name, "open") || strings.Contains(name, "expanded") ||
+				strings.Contains(name, "collapsed") {
+				d.addPattern(DetectedPattern{
+					Type:        PatternAccordion,
+					Line:        sv.LineNumber,
+					Confidence:  0.75,
+					Description: "Accordion/collapsible state",
+					ReactCode:   "useState for expand/collapse",
+					StateVars:   []string{sv.Name},
+					MintyCode:   generateAccordionMinty(sv.Name),
+				})
+			} else if strings.Contains(name, "active") || strings.Contains(name, "enabled") ||
+				strings.Contains(name, "show") || strings.Contains(name, "visible") {
+				d.addPattern(DetectedPattern{
+					Type:        PatternToggle,
+					Line:        sv.LineNumber,
+					Confidence:  0.7,
+					Description: "Toggle/visibility state",
+					ReactCode:   "useState(boolean) for toggle",
+					StateVars:   []string{sv.Name},
+					MintyCode:   generateToggleMinty(sv.Name),
+				})
+			}
+		}
+	}
+	
+	// Pagination pattern: page number state
+	for name, sv := range stateNames {
+		if (strings.Contains(name, "page") || strings.Contains(name, "offset")) &&
+			(sv.InitType == "int" || sv.InitType == "float64") {
+			d.addPattern(DetectedPattern{
+				Type:        PatternPagination,
+				Line:        sv.LineNumber,
+				Confidence:  0.8,
+				Description: "Pagination state",
+				ReactCode:   "useState for page number",
+				StateVars:   []string{sv.Name},
+				MintyCode:   generatePaginationMinty(sv.Name),
+			})
+		}
+	}
+	
+	// Sort pattern: sort column/direction state
+	for name, sv := range stateNames {
+		if strings.Contains(name, "sort") {
+			d.addPattern(DetectedPattern{
+				Type:        PatternSortableTable,
+				Line:        sv.LineNumber,
+				Confidence:  0.8,
+				Description: "Sortable table state",
+				ReactCode:   "useState for sort column/direction",
+				StateVars:   []string{sv.Name},
+				MintyCode:   generateSortableMinty(sv.Name),
+			})
+		}
+	}
+}
+
+// analyzeDerivedPatterns detects patterns from derived variables
+func (d *Detector) analyzeDerivedPatterns(comp *parser.Component) {
+	for _, dv := range comp.DerivedVars {
+		switch dv.Operation {
+		case "filter":
+			// Already handled in analyzeStatePatterns if combined with filter state
+			// But add if standalone
+			alreadyDetected := false
+			for _, p := range d.patterns {
+				if p.Type == PatternFilter {
+					alreadyDetected = true
+					break
+				}
+			}
+			if !alreadyDetected {
+				d.addPattern(DetectedPattern{
+					Type:        PatternFilter,
+					Line:        dv.LineNumber,
+					Confidence:  0.65,
+					Description: "Client-side filtering detected",
+					ReactCode:   dv.Name + " = " + dv.SourceVar + ".filter(...)",
+					DerivedVars: []string{dv.Name},
+					MintyCode:   generateFilterMinty("filter"),
+				})
+			}
+		case "sort":
+			d.addPattern(DetectedPattern{
+				Type:        PatternSortableTable,
+				Line:        dv.LineNumber,
+				Confidence:  0.75,
+				Description: "Client-side sorting detected",
+				ReactCode:   dv.Name + " = " + dv.SourceVar + ".sort(...)",
+				DerivedVars: []string{dv.Name},
+				MintyCode:   generateSortableMinty("sort"),
+			})
 		}
 	}
 }
@@ -410,4 +592,250 @@ func (d *Detector) addPattern(p DetectedPattern) {
 
 func countLines(s string) int {
 	return strings.Count(s, "\n") + 1
+}
+
+// detectAccordionPattern looks for accordion/collapsible patterns
+func (d *Detector) detectAccordionPattern(source string) {
+	accPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)accordion`),
+		regexp.MustCompile(`(?i)collapsible`),
+		regexp.MustCompile(`(?i)expand.*collapse|collapse.*expand`),
+		regexp.MustCompile(`(?i)aria-expanded`),
+	}
+
+	for _, pattern := range accPatterns {
+		if loc := pattern.FindStringIndex(source); loc != nil {
+			line := countLines(source[:loc[0]])
+			d.addPattern(DetectedPattern{
+				Type:        PatternAccordion,
+				Line:        line,
+				Confidence:  0.75,
+				Description: "Accordion/collapsible pattern detected",
+				ReactCode:   "Expand/collapse UI",
+				MintyCode: `mdy.Dyn("accordion").
+    States([]mdy.ComponentState{
+        mdy.NewState("section1", "Section 1", content1),
+        mdy.NewState("section2", "Section 2", content2),
+    }).
+    Options(mdy.AccordionOptions{
+        AllowMultiple: false,
+    }).
+    Build()`,
+			})
+			break
+		}
+	}
+}
+
+// detectTogglePattern looks for toggle/switch patterns
+func (d *Detector) detectTogglePattern(source string) {
+	togglePatterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)toggle|switch`),
+		regexp.MustCompile(`(?i)setIs\w+\(!`),
+		regexp.MustCompile(`(?i)prev\s*=>\s*!prev`),
+		regexp.MustCompile(`(?i)type=["']checkbox["']`),
+	}
+
+	for _, pattern := range togglePatterns {
+		if loc := pattern.FindStringIndex(source); loc != nil {
+			line := countLines(source[:loc[0]])
+			d.addPattern(DetectedPattern{
+				Type:        PatternToggle,
+				Line:        line,
+				Confidence:  0.7,
+				Description: "Toggle/switch pattern detected",
+				ReactCode:   "Boolean toggle state",
+				MintyCode: `// Simple toggle with HTMX:
+b.Button(
+    mi.HtmxPost("/toggle"),
+    mi.HtmxSwap("outerHTML"),
+    "Toggle",
+)
+// Or with mintydyn:
+mdy.Toggle("feature-flag", mdy.ToggleOptions{
+    OnLabel:  "Enabled",
+    OffLabel: "Disabled",
+})`,
+			})
+			break
+		}
+	}
+}
+
+// detectSortableTablePattern looks for sortable table patterns
+func (d *Detector) detectSortableTablePattern(source string) {
+	sortPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?i)sortColumn|sortBy|sortField`),
+		regexp.MustCompile(`(?i)sortDirection|sortOrder|ascending|descending`),
+		regexp.MustCompile(`(?i)\.sort\s*\(`),
+		regexp.MustCompile(`(?i)onClick.*sort`),
+	}
+
+	for _, pattern := range sortPatterns {
+		if loc := pattern.FindStringIndex(source); loc != nil {
+			line := countLines(source[:loc[0]])
+			d.addPattern(DetectedPattern{
+				Type:        PatternSortableTable,
+				Line:        line,
+				Confidence:  0.75,
+				Description: "Sortable table pattern detected",
+				ReactCode:   "Table sorting logic",
+				MintyCode: `mdy.Dyn("table").
+    Data(mdy.FilterableDataset{
+        Items: items,
+        Schema: mdy.FilterSchema{
+            SortableFields: []string{"name", "date", "status"},
+        },
+        Options: mdy.FilterOptions{
+            EnableSort:       true,
+            DefaultSortField: "name",
+            DefaultSortDir:   mdy.SortAsc,
+        },
+    }).
+    Build()`,
+			})
+			break
+		}
+	}
+}
+
+// Helper functions to generate mintydyn code suggestions
+
+func generateTabsMinty(stateName, initValue string) string {
+	return `mdy.Dyn("tabs").
+    States([]mdy.ComponentState{
+        mdy.ActiveState("` + initValue + `", "Tab 1", tab1Content),
+        mdy.NewState("tab2", "Tab 2", tab2Content),
+        mdy.NewState("tab3", "Tab 3", tab3Content),
+    }).
+    Theme(mdy.NewTailwindDynamicTheme()).
+    Build()
+
+// Handler for tab state:
+// GET /tabs?` + stateName + `=<value> → returns updated component HTML`
+}
+
+func generateFilterMinty(stateName string) string {
+	return `mdy.Dyn("filter").
+    Data(mdy.FilterableDataset{
+        Items: items,
+        Schema: mdy.FilterSchema{
+            Fields: []mdy.FilterableField{
+                mdy.TextField("` + stateName + `", "Search"),
+            },
+        },
+        Options: mdy.FilterOptions{
+            EnableSearch: true,
+            Debounce:     300, // ms
+        },
+    }).
+    Build()
+
+// Handler:
+// GET /filter?` + stateName + `=<value> → returns filtered results HTML`
+}
+
+func generateModalMinty(stateName string) string {
+	return `// HTMX modal pattern (recommended):
+b.Button(
+    mi.HtmxGet("/modal-content"),
+    mi.HtmxTarget("#modal-container"),
+    mi.HtmxSwap("innerHTML"),
+    "Open Modal",
+)
+
+// Modal container (in layout):
+b.Div(mi.ID("modal-container"),
+    mi.Class("fixed inset-0 z-50 hidden"),
+)
+
+// Close handler in modal content:
+mi.HtmxDelete("/modal", mi.HtmxTarget("#modal-container"), mi.HtmxSwap("innerHTML"))`
+}
+
+func generateAccordionMinty(stateName string) string {
+	return `mdy.Dyn("accordion").
+    States([]mdy.ComponentState{
+        mdy.NewState("section1", "Section 1", section1Content),
+        mdy.NewState("section2", "Section 2", section2Content),
+    }).
+    Options(mdy.AccordionOptions{
+        AllowMultiple: false,
+        DefaultOpen:   "",
+    }).
+    Build()
+
+// Or with HTMX:
+b.Div(mi.Class("accordion"),
+    b.Button(
+        mi.HtmxGet("/section/1"),
+        mi.HtmxTarget("#section-1-content"),
+        mi.HtmxSwap("innerHTML"),
+        "Section 1",
+    ),
+    b.Div(mi.ID("section-1-content")),
+)`
+}
+
+func generateToggleMinty(stateName string) string {
+	return `// Simple HTMX toggle:
+b.Button(
+    mi.HtmxPost("/toggle-` + stateName + `"),
+    mi.HtmxSwap("outerHTML"),
+    mi.Class("toggle-btn"),
+    "Toggle",
+)
+
+// Handler returns updated button state:
+// POST /toggle-` + stateName + ` → returns button HTML with updated state`
+}
+
+func generatePaginationMinty(stateName string) string {
+	return `mdy.Dyn("list").
+    Data(mdy.FilterableDataset{
+        Items: items,
+        Options: mdy.FilterOptions{
+            EnablePagination: true,
+            ItemsPerPage:     20,
+        },
+    }).
+    Build()
+
+// Or HTMX pagination:
+b.Div(mi.ID("pagination"),
+    b.Button(
+        mi.HtmxGet("/items?page=1"),
+        mi.HtmxTarget("#item-list"),
+        "Previous",
+    ),
+    b.Span("Page 1 of 10"),
+    b.Button(
+        mi.HtmxGet("/items?page=2"),
+        mi.HtmxTarget("#item-list"),
+        "Next",
+    ),
+)`
+}
+
+func generateSortableMinty(stateName string) string {
+	return `mdy.Dyn("table").
+    Data(mdy.FilterableDataset{
+        Items: items,
+        Schema: mdy.FilterSchema{
+            SortableFields: []string{"name", "date", "status"},
+        },
+        Options: mdy.FilterOptions{
+            EnableSort:       true,
+            DefaultSortField: "name",
+            DefaultSortDir:   mdy.SortAsc,
+        },
+    }).
+    Build()
+
+// Or HTMX sortable headers:
+b.Th(
+    mi.HtmxGet("/items?sort=name&dir=asc"),
+    mi.HtmxTarget("#table-body"),
+    "Name ↑",
+)`
 }

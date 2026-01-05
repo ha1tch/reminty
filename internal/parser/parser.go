@@ -3,12 +3,14 @@ package parser
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
 // Parser parses JSX tokens into an AST
 type Parser struct {
 	tokens      []Token
+	source      string // original source for regex-based extraction
 	pos         int
 	warnings    []Warning
 	suggestions []Suggestion
@@ -22,12 +24,33 @@ func NewParser(tokens []Token) *Parser {
 	}
 }
 
+// NewParserWithSource creates a parser with access to original source
+func NewParserWithSource(tokens []Token, source string) *Parser {
+	return &Parser{
+		tokens: tokens,
+		source: source,
+		pos:    0,
+	}
+}
+
 // Parse parses a complete JSX file
 func (p *Parser) Parse() *ParseResult {
 	file := &File{
 		Imports:    []Import{},
 		Components: []Component{},
 		Exports:    []string{},
+	}
+
+	// Pre-extract all useState variables from source
+	var allStateVars []StateVariable
+	if p.source != "" {
+		allStateVars = extractUseStateVars(p.source)
+	}
+	
+	// Pre-extract all derived variables from source
+	var allDerivedVars []DerivedVariable
+	if p.source != "" {
+		allDerivedVars = extractDerivedVars(p.source, allStateVars)
 	}
 
 	for !p.isAtEnd() {
@@ -58,11 +81,39 @@ func (p *Parser) Parse() *ParseResult {
 		p.advance()
 	}
 
+	// Associate state vars and derived vars with components based on line numbers
+	for i := range file.Components {
+		comp := &file.Components[i]
+		compStart := comp.LineNumber
+		compEnd := p.findComponentEnd(comp, file.Components, i)
+		
+		for _, sv := range allStateVars {
+			if sv.LineNumber >= compStart && sv.LineNumber < compEnd {
+				comp.StateVars = append(comp.StateVars, sv)
+			}
+		}
+		
+		for _, dv := range allDerivedVars {
+			if dv.LineNumber >= compStart && dv.LineNumber < compEnd {
+				comp.DerivedVars = append(comp.DerivedVars, dv)
+			}
+		}
+	}
+
 	return &ParseResult{
 		File:        file,
 		Warnings:    p.warnings,
 		Suggestions: p.suggestions,
 	}
+}
+
+// findComponentEnd returns the line where the next component starts, or a large number
+func (p *Parser) findComponentEnd(comp *Component, comps []Component, idx int) int {
+	if idx+1 < len(comps) {
+		return comps[idx+1].LineNumber
+	}
+	// No next component, use a large number
+	return 999999
 }
 
 // ParseJSX parses just a JSX element (for testing or partial conversion)
@@ -263,7 +314,15 @@ func (p *Parser) parseAttribute() *Attribute {
 
 	// String value
 	if p.check(TokenString) {
-		attr.Value = p.advance().Value
+		val := p.advance().Value
+		// Strip surrounding quotes (lexer now includes them)
+		if len(val) >= 2 {
+			if (val[0] == '"' && val[len(val)-1] == '"') ||
+				(val[0] == '\'' && val[len(val)-1] == '\'') {
+				val = val[1 : len(val)-1]
+			}
+		}
+		attr.Value = val
 		return attr
 	}
 
@@ -272,10 +331,68 @@ func (p *Parser) parseAttribute() *Attribute {
 		p.advance()
 		expr := p.parseExpressionContent()
 		attr.Expression = expr
+		
+		// Check if this is an event handler
+		if isEventHandler(attr.Name) {
+			attr.EventHandler = parseEventHandler(attr.Name, expr.Raw, expr.LineNumber)
+		}
+		
 		return attr
 	}
 
 	return attr
+}
+
+// isEventHandler checks if an attribute name is an event handler
+func isEventHandler(name string) bool {
+	return strings.HasPrefix(name, "on") && len(name) > 2 && 
+		name[2] >= 'A' && name[2] <= 'Z'
+}
+
+// parseEventHandler parses an event handler expression
+func parseEventHandler(eventType, body string, line int) *EventHandler {
+	handler := &EventHandler{
+		EventType:   eventType,
+		HandlerBody: body,
+		LineNumber:  line,
+	}
+	
+	// Check for inline arrow function
+	if strings.Contains(body, "=>") {
+		handler.IsInline = true
+	}
+	
+	// Extract setState calls: setX, setY, etc.
+	setterPattern := regexp.MustCompile(`(set[A-Z]\w*)\s*\(`)
+	setterMatches := setterPattern.FindAllStringSubmatch(body, -1)
+	for _, match := range setterMatches {
+		if len(match) > 1 {
+			handler.SetterCalls = append(handler.SetterCalls, match[1])
+		}
+	}
+	
+	// Extract state variables referenced (simple identifiers that might be state)
+	// Look for identifiers that aren't setters and aren't common keywords
+	identPattern := regexp.MustCompile(`\b([a-z][a-zA-Z0-9]*)\b`)
+	identMatches := identPattern.FindAllStringSubmatch(body, -1)
+	seen := make(map[string]bool)
+	keywords := map[string]bool{
+		"true": true, "false": true, "null": true, "undefined": true,
+		"return": true, "if": true, "else": true, "const": true, "let": true,
+		"var": true, "function": true, "new": true, "this": true,
+		"event": true, "e": true, "target": true, "value": true,
+	}
+	for _, match := range identMatches {
+		if len(match) > 1 {
+			ident := match[1]
+			if !seen[ident] && !keywords[ident] && !strings.HasPrefix(ident, "set") {
+				seen[ident] = true
+				handler.StateVars = append(handler.StateVars, ident)
+			}
+		}
+	}
+	
+	return handler
 }
 
 func (p *Parser) parseExpression() Node {
@@ -615,6 +732,254 @@ func (p *Parser) detectHook(name string) *Hook {
 	return hook
 }
 
+// extractUseStateVars scans source for useState patterns and extracts StateVariables
+func extractUseStateVars(source string) []StateVariable {
+	var stateVars []StateVariable
+	
+	// Pattern: const [varName, setVarName] = useState(initValue)
+	// Also handles: const [varName, setVarName] = useState<Type>(initValue)
+	pattern := regexp.MustCompile(`const\s+\[(\w+),\s*(\w+)\]\s*=\s*useState(?:<[^>]+>)?\s*\(([^)]*)\)`)
+	
+	matches := pattern.FindAllStringSubmatchIndex(source, -1)
+	for _, match := range matches {
+		if len(match) >= 8 {
+			varName := source[match[2]:match[3]]
+			setterName := source[match[4]:match[5]]
+			initValue := strings.TrimSpace(source[match[6]:match[7]])
+			
+			// Infer type from initial value
+			initType := inferTypeFromValue(initValue)
+			
+			// Calculate line number
+			lineNum := 1 + strings.Count(source[:match[0]], "\n")
+			
+			stateVars = append(stateVars, StateVariable{
+				Name:       varName,
+				Setter:     setterName,
+				InitValue:  initValue,
+				InitType:   initType,
+				LineNumber: lineNum,
+			})
+		}
+	}
+	
+	return stateVars
+}
+
+// inferTypeFromValue guesses Go type from JS initial value
+func inferTypeFromValue(val string) string {
+	val = strings.TrimSpace(val)
+	
+	// Empty or quotes = string
+	if val == "" || val == `""` || val == "''" || val == "``" {
+		return "string"
+	}
+	
+	// Quoted string
+	if (strings.HasPrefix(val, `"`) && strings.HasSuffix(val, `"`)) ||
+		(strings.HasPrefix(val, "'") && strings.HasSuffix(val, "'")) ||
+		(strings.HasPrefix(val, "`") && strings.HasSuffix(val, "`")) {
+		return "string"
+	}
+	
+	// Boolean
+	if val == "true" || val == "false" {
+		return "bool"
+	}
+	
+	// Number
+	if _, err := strconv.Atoi(val); err == nil {
+		return "int"
+	}
+	if _, err := strconv.ParseFloat(val, 64); err == nil {
+		return "float64"
+	}
+	
+	// Array
+	if strings.HasPrefix(val, "[") {
+		return "[]interface{}"
+	}
+	
+	// Object
+	if strings.HasPrefix(val, "{") {
+		return "map[string]interface{}"
+	}
+	
+	// null/undefined
+	if val == "null" || val == "undefined" {
+		return "interface{}"
+	}
+	
+	// Variable reference with plural name (likely array prop)
+	lowerVal := strings.ToLower(val)
+	if strings.HasSuffix(lowerVal, "s") && !strings.HasSuffix(lowerVal, "ss") && 
+		len(lowerVal) > 3 && isSimpleIdent(val) {
+		return "[]interface{}"
+	}
+	if strings.Contains(lowerVal, "items") || strings.Contains(lowerVal, "list") || 
+		strings.Contains(lowerVal, "data") || strings.Contains(lowerVal, "array") {
+		return "[]interface{}"
+	}
+	
+	// Default
+	return "interface{}"
+}
+
+// isSimpleIdent checks if s is a simple identifier (for parser)
+func isSimpleIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		if i == 0 {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' || r == '$') {
+				return false
+			}
+		} else {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '$') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// extractDerivedVars scans source for derived state patterns
+// e.g., const filteredUsers = users.filter(user => ...)
+func extractDerivedVars(source string, stateVars []StateVariable) []DerivedVariable {
+	var derivedVars []DerivedVariable
+	
+	// Build set of known state var names for dependency tracking
+	stateNames := make(map[string]bool)
+	for _, sv := range stateVars {
+		stateNames[sv.Name] = true
+	}
+	
+	// Patterns for array operations:
+	// const x = y.filter(...) | .map(...) | .find(...) | .some(...) | .every(...) | .reduce(...) | .sort(...)
+	patterns := []struct {
+		regex    *regexp.Regexp
+		opType   string
+		resultType string
+	}{
+		{
+			regexp.MustCompile(`const\s+(\w+)\s*=\s*(\w+)\.filter\s*\(`),
+			"filter",
+			"[]interface{}",
+		},
+		{
+			regexp.MustCompile(`const\s+(\w+)\s*=\s*(\w+)\.map\s*\(`),
+			"map",
+			"[]interface{}",
+		},
+		{
+			regexp.MustCompile(`const\s+(\w+)\s*=\s*(\w+)\.find\s*\(`),
+			"find",
+			"interface{}",
+		},
+		{
+			regexp.MustCompile(`const\s+(\w+)\s*=\s*(\w+)\.some\s*\(`),
+			"some",
+			"bool",
+		},
+		{
+			regexp.MustCompile(`const\s+(\w+)\s*=\s*(\w+)\.every\s*\(`),
+			"every",
+			"bool",
+		},
+		{
+			regexp.MustCompile(`const\s+(\w+)\s*=\s*(\w+)\.reduce\s*\(`),
+			"reduce",
+			"interface{}",
+		},
+		{
+			regexp.MustCompile(`const\s+(\w+)\s*=\s*(\w+)\.sort\s*\(`),
+			"sort",
+			"[]interface{}",
+		},
+		{
+			regexp.MustCompile(`const\s+(\w+)\s*=\s*(\w+)\.slice\s*\(`),
+			"slice",
+			"[]interface{}",
+		},
+	}
+	
+	for _, p := range patterns {
+		matches := p.regex.FindAllStringSubmatchIndex(source, -1)
+		for _, match := range matches {
+			if len(match) >= 6 {
+				varName := source[match[2]:match[3]]
+				sourceName := source[match[4]:match[5]]
+				
+				// Skip if this is a useState destructuring (already handled)
+				if strings.Contains(source[max(0, match[0]-20):match[0]], "[") {
+					continue
+				}
+				
+				// Find the full expression (up to the matching closing paren)
+				exprStart := match[0]
+				exprEnd := findMatchingParen(source, match[5])
+				fullExpr := ""
+				if exprEnd > match[5] {
+					fullExpr = source[exprStart:exprEnd]
+				}
+				
+				// Calculate line number
+				lineNum := 1 + strings.Count(source[:match[0]], "\n")
+				
+				// Find dependencies - which state vars are referenced in the expression
+				var deps []string
+				for stateName := range stateNames {
+					// Check if state var is used in the expression
+					if strings.Contains(fullExpr, stateName) {
+						deps = append(deps, stateName)
+					}
+				}
+				// Also add source collection if it's a state var
+				if stateNames[sourceName] {
+					deps = append(deps, sourceName)
+				}
+				
+				derivedVars = append(derivedVars, DerivedVariable{
+					Name:       varName,
+					Expression: fullExpr,
+					SourceVar:  sourceName,
+					Operation:  p.opType,
+					ResultType: p.resultType,
+					DependsOn:  deps,
+					LineNumber: lineNum,
+				})
+			}
+		}
+	}
+	
+	return derivedVars
+}
+
+// findMatchingParen finds the position after the matching closing paren
+func findMatchingParen(s string, start int) int {
+	depth := 1
+	for i := start; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return -1
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func (p *Parser) analyzeExpression(expr Expression) Node {
 	raw := expr.Raw
 
@@ -624,13 +989,37 @@ func (p *Parser) analyzeExpression(expr Expression) Node {
 		collection := matches[1]
 		itemVar := matches[2]
 		indexVar := ""
-		if len(matches) > 3 {
+		if len(matches) > 3 && matches[3] != "" {
 			indexVar = matches[3]
 		}
 
 		// Find the JSX body after the arrow
 		bodyStart := mapRegex.FindStringIndex(raw)[1]
 		bodyRaw := raw[bodyStart:]
+
+		// Strip leading whitespace
+		bodyRaw = strings.TrimLeft(bodyRaw, " \t\n\r")
+
+		// If body starts with '(', find matching ')' and extract content
+		if strings.HasPrefix(bodyRaw, "(") {
+			bodyRaw = bodyRaw[1:] // skip opening paren
+			// Find matching closing paren
+			depth := 1
+			for i, ch := range bodyRaw {
+				if ch == '(' {
+					depth++
+				} else if ch == ')' {
+					depth--
+					if depth == 0 {
+						bodyRaw = bodyRaw[:i]
+						break
+					}
+				}
+			}
+		}
+
+		// Strip trailing closing parens from map call
+		bodyRaw = strings.TrimRight(bodyRaw, " \t\n\r)")
 
 		// Parse the body as JSX
 		bodyLexer := NewLexer(bodyRaw)
@@ -652,7 +1041,10 @@ func (p *Parser) analyzeExpression(expr Expression) Node {
 	if matches := andRegex.FindStringSubmatch(raw); matches != nil {
 		condition := strings.TrimSpace(matches[1])
 		bodyStart := andRegex.FindStringIndex(raw)[1]
-		bodyRaw := raw[bodyStart:]
+		bodyRaw := strings.TrimSpace(raw[bodyStart:])
+		
+		// Strip outer parentheses if present
+		bodyRaw = stripOuterParens(bodyRaw)
 
 		bodyLexer := NewLexer(bodyRaw)
 		bodyTokens := bodyLexer.Tokenize()
@@ -677,16 +1069,32 @@ func (p *Parser) analyzeExpression(expr Expression) Node {
 		// Find the : separator (accounting for nesting)
 		colonIdx := findTernaryColon(rest)
 		if colonIdx > 0 {
-			consequentRaw := rest[:colonIdx]
-			alternateRaw := rest[colonIdx+1:]
+			consequentRaw := strings.TrimSpace(rest[:colonIdx])
+			alternateRaw := strings.TrimSpace(rest[colonIdx+1:])
 
-			consequentLexer := NewLexer(consequentRaw)
-			consequentParser := NewParser(consequentLexer.Tokenize())
-			consequent := consequentParser.ParseJSX()
+			// Strip outer parentheses if present
+			consequentRaw = stripOuterParens(consequentRaw)
+			alternateRaw = stripOuterParens(alternateRaw)
 
-			alternateLexer := NewLexer(alternateRaw)
-			alternateParser := NewParser(alternateLexer.Tokenize())
-			alternate := alternateParser.ParseJSX()
+			// Parse consequent - check if it's a .map() expression first
+			var consequent Node
+			if isMapExpression(consequentRaw) {
+				consequent = p.analyzeExpression(Expression{Raw: consequentRaw, LineNumber: expr.LineNumber})
+			} else {
+				consequentLexer := NewLexer(consequentRaw)
+				consequentParser := NewParser(consequentLexer.Tokenize())
+				consequent = consequentParser.ParseJSX()
+			}
+
+			// Parse alternate - check if it's a .map() expression first
+			var alternate Node
+			if isMapExpression(alternateRaw) {
+				alternate = p.analyzeExpression(Expression{Raw: alternateRaw, LineNumber: expr.LineNumber})
+			} else {
+				alternateLexer := NewLexer(alternateRaw)
+				alternateParser := NewParser(alternateLexer.Tokenize())
+				alternate = alternateParser.ParseJSX()
+			}
 
 			return &Ternary{
 				Condition:  condition,
@@ -698,6 +1106,38 @@ func (p *Parser) analyzeExpression(expr Expression) Node {
 	}
 
 	return nil
+}
+
+// isMapExpression checks if the string looks like a .map() expression
+func isMapExpression(s string) bool {
+	return regexp.MustCompile(`^\w+(?:\.\w+)*\.map\s*\(`).MatchString(s)
+}
+
+// stripOuterParens removes outer parentheses from a string if balanced
+func stripOuterParens(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "(") {
+		return s
+	}
+	
+	// Check if the outer parens are balanced
+	depth := 0
+	for i, ch := range s {
+		if ch == '(' {
+			depth++
+		} else if ch == ')' {
+			depth--
+			if depth == 0 {
+				// If we hit depth 0 before the end, parens aren't outer
+				if i < len(s)-1 {
+					return s
+				}
+				// Strip the outer parens
+				return strings.TrimSpace(s[1 : len(s)-1])
+			}
+		}
+	}
+	return s
 }
 
 func findTernaryColon(s string) int {

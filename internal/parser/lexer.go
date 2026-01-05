@@ -260,8 +260,8 @@ func (l *Lexer) scanWhitespace() {
 }
 
 func (l *Lexer) scanString(quote byte) {
-	l.advance() // consume opening quote
-	start := l.pos
+	start := l.pos // includes opening quote
+	l.advance()    // consume opening quote
 	for l.pos < len(l.input) {
 		ch := l.peek()
 		if ch == '\\' {
@@ -270,8 +270,8 @@ func (l *Lexer) scanString(quote byte) {
 			continue
 		}
 		if ch == quote {
-			value := l.input[start:l.pos]
 			l.advance() // consume closing quote
+			value := l.input[start:l.pos] // includes both quotes
 			l.emit(TokenString, value)
 			return
 		}
